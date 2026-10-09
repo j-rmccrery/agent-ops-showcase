@@ -1,0 +1,66 @@
+name: OpenAPI Drift
+
+# the two openapi.yaml documents — this repo's as-built spec
+# and app's FE contract spec (branch rc, generates src/contracts/api.d.ts)
+# — describe the same deployed API with no mechanical link. This job diffs
+# their paths and schema shapes so they cannot silently drift.
+#
+# Reading a red run:
+#   - "op-missing-fe" right after a backend PR adds an endpoint = the FE sync
+#     PR hasn't landed on rc yet. Expected red during that window (the
+#     backend → FE sync flow); it turns green when the sync lands.
+#   - Anything else = real drift. Fix the stale document, or — only if the
+#     difference is permanent by design — add it to
+#     scripts/openapi-drift-allowlist.yaml with a reason.
+# See README.md "API contract drift check".
+#
+# Credential note: app is a PRIVATE repo, so the default GITHUB_TOKEN
+# (scoped to this repo only) cannot check it out. CONTRACT_SYNC_TOKEN must be
+# a repo secret holding a fine-grained PAT with read-only Contents access to
+# your-org/app. Creating it is deliberately not automated (agents
+# do not create secrets). Until it exists, this job fails at the guard
+# step below with instructions, not with a confusing checkout error.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  drift:
+    name: openapi.yaml drift vs app rc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # secrets.* is not allowed in `if:` expressions, hence the env+shell check.
+      - name: Require CONTRACT_SYNC_TOKEN (app is private)
+        env:
+          CONTRACT_SYNC_TOKEN: ${{ secrets.CONTRACT_SYNC_TOKEN }}
+        run: |
+          if [ -z "$CONTRACT_SYNC_TOKEN" ]; then
+            echo "::error::CONTRACT_SYNC_TOKEN repo secret is not set. app is private, so this check cannot fetch the FE openapi.yaml. Add a fine-grained PAT with read-only Contents access to your-org/app as the CONTRACT_SYNC_TOKEN secret See .github/workflows/openapi-drift.yml header."
+            exit 1
+          fi
+
+      # Compare against app's rc HEAD — rc is the FE's integration
+      # branch (main lags rc), so this is where an FE contract sync lands.
+      - name: Check out app (rc)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: your-org/app
+          ref: rc
+          token: ${{ secrets.CONTRACT_SYNC_TOKEN }}
+          path: app
+          sparse-checkout: openapi.yaml
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Diff the two openapi.yaml documents
+        run: node scripts/check-openapi-drift.js openapi.yaml app/openapi.yaml

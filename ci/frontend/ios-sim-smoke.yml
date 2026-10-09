@@ -1,0 +1,306 @@
+name: iOS Simulator Smoke
+
+# post-publish runtime gate for the iOS surface.
+#
+# Nothing else in the pipeline ever RUNS the app on iOS — the PR-level
+# Metro export gate catches bundling breaks, but a change can bundle and
+# publish cleanly and still render or behave wrong on native only (e.g.
+# the invisible-footer class: fine on web, no visible text on iOS). This
+# workflow downloads the EAS `sim`-profile build (channel rc — it fetches
+# the latest rc OTA on launch), boots a simulator on the hosted macOS
+# runner, and runs the Maestro flows, uploading screenshots as run
+# artifacts either way. The workflow adds two halves on top: an AUTHENTICATED
+# sweep (persistent QA account, real email-OTP sign-in, branded signed-in
+# surfaces) that runs only when the QA-account secrets exist, and an in-workflow
+# design-QA verdict that judges every collected screenshot against
+# scripts/design-qa/native-sweep-expectations.md and turns the run red on
+# a render defect.
+#
+# Triggering: called from eas-update.yml (needs: the publish job) so it
+# only runs AFTER a successful OTA publish — a workflow_run trigger would
+# not arm until this file reaches the default branch, and would not
+# guarantee publish ordering. workflow_dispatch covers on-demand runs and
+# (with rebuild=true) triggering a fresh EAS simulator build when a native
+# change / expo.version bump obsoletes the current one.
+#
+# Cost: $0 — runs on the self-hosted Intel Mac runner ("runner", labels
+# self-hosted/macOS/X64) instead of a paid hosted macOS image. Per-PR runs
+# are deliberately out of scope. Two consequences of the persistent host:
+# the boot step tolerates an already-booted simulator, and stale Maestro
+# screenshots are cleared pre-run so the design-QA verdict only ever judges
+# the current run's output. Fallback: the runner is x86_64 — if simctl
+# install ever rejects the EAS artifact (arm64-only build), revert runs-on
+# to macos-15 and fix the EAS sim profile's architectures in its own change.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      rebuild:
+        description: "Trigger a new EAS simulator build (channel rc) instead of running the smoke"
+        type: boolean
+        default: false
+
+jobs:
+  trigger-sim-build:
+    name: Trigger EAS simulator build (channel rc)
+    if: github.event_name == 'workflow_dispatch' && inputs.rebuild
+    runs-on: ubuntu-latest
+    env:
+      EAS_PROJECT_ID: ${{ secrets.EAS_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - uses: expo/expo-github-action@c7b66a9c327a43a8fa7c0158e7f30d6040d2481e # v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+      # --no-wait: the build runs on EAS's infra; this job just queues it.
+      # Once it finishes (expo.dev dashboard), smoke runs pick it up
+      # automatically — the resolve step below always takes the newest
+      # finished sim build.
+      - run: eas build --platform ios --profile sim --non-interactive --no-wait
+
+  smoke:
+    name: Simulator smoke (Maestro)
+    if: github.event_name != 'workflow_dispatch' || !inputs.rebuild
+    runs-on: [self-hosted, macOS]
+    # Stacked rc merges: only the final state matters — cancel superseded
+    # smokes (the publish job itself is serialized without cancellation in
+    # eas-update.yml; this group is independent of that one).
+    concurrency:
+      group: ios-sim-smoke
+      cancel-in-progress: true
+    # id-token: the authenticated sweep assumes the same SES-inbound
+    # reader role deploy-web.yml's e2e-happy-path uses, via OIDC — no stored AWS keys.
+    permissions:
+      id-token: write
+      contents: read
+      # issues: the human-review prompt posts a comment on the triggering
+      # PR (PR comments ride the issues API). The caller must grant these
+      # too — a called workflow is capped at its caller's grant (see the
+      # startup_failure caused by a missing id-token grant).
+      issues: write
+      pull-requests: write
+    env:
+      EAS_PROJECT_ID: ${{ secrets.EAS_PROJECT_ID }}
+      # presence of the persistent QA account's secrets switches the
+      # authenticated sweep on. Absent, every authenticated step no-ops and the
+      # job behaves exactly as before.
+      QA_PERSISTENT_TEST_EMAIL: ${{ secrets.QA_PERSISTENT_TEST_EMAIL }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+      # eas-cli evaluates app.config.ts (extra.eas.projectId) in this
+      # directory, so dependencies must be installed even though the app
+      # itself is not built here.
+      - run: npm ci
+      - uses: expo/expo-github-action@c7b66a9c327a43a8fa7c0158e7f30d6040d2481e # v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Resolve the latest finished sim build
+        id: build
+        # Filter by profile in jq rather than a CLI flag so an eas-cli
+        # flag rename can't silently change which builds are considered.
+        run: |
+          url=$(eas build:list --platform ios --status finished --limit 20 --non-interactive --json \
+            | jq -r '[.[] | select(.buildProfile == "sim")][0].artifacts.buildUrl // empty')
+          if [ -z "$url" ]; then
+            echo "::error::No finished 'sim'-profile EAS build found. Dispatch this workflow with rebuild=true, wait for the EAS build to finish, then re-run."
+            exit 1
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Download and extract the simulator app
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/sim.tar.gz" "${{ steps.build.outputs.url }}"
+          mkdir -p "$RUNNER_TEMP/sim"
+          tar -xzf "$RUNNER_TEMP/sim.tar.gz" -C "$RUNNER_TEMP/sim"
+          app_path=$(find "$RUNNER_TEMP/sim" -maxdepth 2 -name "*.app" -print -quit)
+          if [ -z "$app_path" ]; then
+            echo "::error::No .app bundle inside the EAS artifact."
+            exit 1
+          fi
+          echo "APP_PATH=$app_path" >> "$GITHUB_ENV"
+
+      - name: Boot a simulator and install the app
+        run: |
+          udid=$(xcrun simctl list devices available -j \
+            | jq -r '[.devices[] | .[] | select(.name | startswith("iPhone"))][0].udid // empty')
+          if [ -z "$udid" ]; then
+            echo "::error::No available iPhone simulator on this runner image."
+            exit 1
+          fi
+          # Persistent runner: the device may still be booted from the last
+          # run — boot only if needed, and let bootstatus be the real check.
+          state=$(xcrun simctl list devices -j | jq -r --arg u "$udid" '.devices[] | .[] | select(.udid == $u).state')
+          if [ "$state" != "Booted" ]; then
+            xcrun simctl boot "$udid"
+          fi
+          xcrun simctl bootstatus "$udid"
+          xcrun simctl install "$udid" "$APP_PATH"
+          echo "UDID=$udid" >> "$GITHUB_ENV"
+
+      - name: Install Maestro
+        # pinned — no workflow here declared a version, so this uses
+        # the latest stable CLI release (cli-2.10.0, mobile-dev-inc/maestro,
+        # published 2026-08-31) via the installer's own documented
+        # MAESTRO_VERSION override, rather than floating on whatever
+        # get.maestro.mobile.dev serves by default.
+        run: |
+          MAESTRO_VERSION=2.10.0 curl -fsSL https://get.maestro.mobile.dev | bash
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+
+      - name: Clear stale Maestro output (persistent runner)
+        # $HOME persists between runs on the self-hosted runner. The collect
+        # step below sweeps $HOME/.maestro for PNGs, so a leftover test dir
+        # would feed a previous run's screenshots into this run's design-QA
+        # verdict. RUNNER_TEMP and the workspace are cleaned by the runner
+        # and checkout respectively; this dir is the only carry-over.
+        run: rm -rf "$HOME/.maestro/tests"
+
+      - name: Run smoke flows
+        # Flow files are named explicitly: the directory form would
+        # also pick up rc-authenticated-sweep.yaml, which must only run when
+        # the persistent QA account's secrets exist — see the steps below.
+        run: maestro test .maestro/rc-smoke.yaml --debug-output "$RUNNER_TEMP/maestro-debug"
+
+      # ── authenticated sweep ─────────────────────────────────────
+      # Signs into the persistent QA account through the app's own
+      # sign-in + email-OTP screens and screenshots the branded signed-in
+      # surfaces — the render coverage no PR gate has. The OTP is read from
+      # the S3 inbound bucket by a localhost shim (scripts/qa/otp-shim.ts);
+      # Maestro polls the shim and types the code into the app's own field.
+      # The flow never taps a destructive control — the QA account survives
+      # every run.
+
+      - name: Configure AWS credentials (SES inbound QA reader)
+        if: env.QA_PERSISTENT_TEST_EMAIL != ''
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Start the OTP shim
+        if: env.QA_PERSISTENT_TEST_EMAIL != ''
+        run: |
+          npx tsx scripts/qa/otp-shim.ts 2> "$RUNNER_TEMP/otp-shim.log" &
+          echo "OTP_SHIM_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8765/healthz > /dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "::error::OTP shim never became healthy"; cat "$RUNNER_TEMP/otp-shim.log"; exit 1
+
+      - name: Run authenticated sweep
+        id: auth-sweep
+        if: env.QA_PERSISTENT_TEST_EMAIL != ''
+        env:
+          QA_EMAIL: ${{ secrets.QA_PERSISTENT_TEST_EMAIL }}
+          QA_PASSWORD: ${{ secrets.QA_PERSISTENT_TEST_PASSWORD }}
+        # Explicit -e parameters (Maestro's canonical mechanism) rather than
+        # MAESTRO_-prefixed env auto-injection — the values come from env
+        # vars here, so GitHub still masks them in the log.
+        run: maestro test -e QA_EMAIL="$QA_EMAIL" -e QA_PASSWORD="$QA_PASSWORD" .maestro/rc-authenticated-sweep.yaml --debug-output "$RUNNER_TEMP/maestro-debug-auth"
+
+      - name: Dump the live view hierarchy (sweep failed)
+        # when the sweep dies, the failure screenshot sits in an
+        # artifact that needs downloading — this prints the CURRENT screen's
+        # accessibility tree straight into the log, so whatever screen (or
+        # error alert) the app is stuck on is readable off the run page.
+        # Keep it after the sweep and before the shim teardown: the app is
+        # still foregrounded on the simulator at this point.
+        if: failure() && env.QA_PERSISTENT_TEST_EMAIL != ''
+        # Compact pass first — only elements with non-empty text/labels/ids,
+        # which is where an error alert's message shows up (an earlier flat
+        # 300-line cap spent itself on empty container nodes and cut off the
+        # screen body). The full tree goes into the artifact via the debug
+        # dir rather than the log.
+        run: |
+          mkdir -p "$RUNNER_TEMP/maestro-debug-auth"
+          maestro hierarchy 2>/dev/null > "$RUNNER_TEMP/maestro-debug-auth/failure-hierarchy.json" || true
+          echo "--- non-empty text/labels/ids on the stuck screen ---"
+          grep -oE '"(text|accessibilityText|hintText|title|value|resource-id)" : "[^"]+"' \
+            "$RUNNER_TEMP/maestro-debug-auth/failure-hierarchy.json" | head -200 || echo "hierarchy dump unavailable"
+
+      - name: Stop the OTP shim
+        if: always() && env.OTP_SHIM_PID != ''
+        run: |
+          kill "$OTP_SHIM_PID" 2>/dev/null || true
+          echo "--- otp-shim log ---"; cat "$RUNNER_TEMP/otp-shim.log" 2>/dev/null || true
+
+      - name: Collect screenshots
+        # Maestro's takeScreenshot output location has moved between
+        # releases (workspace takeScreenshot/ folder, ~/.maestro/tests,
+        # cwd) — two green runs uploaded nothing from pattern-based
+        # globs. Stop guessing: sweep every plausible root for PNGs into
+        # one dir, and log what was found so the next debugging session
+        # reads it off the run page instead of rediscovering this.
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/smoke-shots"
+          find "$PWD" "$HOME/.maestro" "$RUNNER_TEMP/maestro-debug" "$RUNNER_TEMP/maestro-debug-auth" \
+            -name '*.png' -not -path '*/node_modules/*' -not -path '*/assets/*' \
+            -print -exec cp {} "$RUNNER_TEMP/smoke-shots/" \; 2>/dev/null || true
+          echo "Collected: $(ls -1 "$RUNNER_TEMP/smoke-shots" | wc -l) screenshot(s)"
+
+      - name: Design-QA verdict on the screenshots
+        # judge every collected screenshot against the checked-in
+        # expectations. A "fail" verdict exits 1 and turns this run red; a
+        # missing ANTHROPIC_API_KEY or an API failure degrades to a
+        # ::warning:: annotation (never a fake pass, never a fake render
+        # failure — see the script header). Runs even when a flow above
+        # failed: partial screenshots still carry signal.
+        if: ${{ !cancelled() }}
+        env:
+          # Either credential works; the script prefers the API key when
+          # both exist. CLAUDE_CODE_OAUTH_TOKEN is minted from a claude.ai
+          # subscription via `claude setup-token`.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          npx tsx scripts/design-qa/native-sweep-verdict.ts \
+            --shots="$RUNNER_TEMP/smoke-shots" \
+            --out="$RUNNER_TEMP/smoke-shots/design-qa-verdict.json"
+
+      - name: Prompt for human screenshot review on the triggering PR
+        # no-credential judging mode: the
+        # screenshots are reviewed by a human, so each publish pings the PR
+        # whose merge triggered it — a GitHub notification instead of
+        # silence. Skips quietly when there are no screenshots or no
+        # associated PR (e.g. a workflow_dispatch run, which is attended).
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SWEEP_OUTCOME: ${{ steps.auth-sweep.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          count=$(find "$RUNNER_TEMP/smoke-shots" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$count" = "0" ]; then echo "no screenshots — skipping review prompt"; exit 0; fi
+          pr=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" --jq '.[0].number' 2>/dev/null || true)
+          if [ -z "$pr" ]; then echo "no associated PR — skipping review prompt"; exit 0; fi
+          gh api "repos/${{ github.repository }}/issues/$pr/comments" -f body="📱 **iOS sim screenshots ready for review** — $count PNG(s) captured from this merge's rc publish.
+
+          Authenticated sweep: **$SWEEP_OUTCOME**. Checklist to review against: \`scripts/design-qa/native-sweep-expectations.md\`.
+
+          Download the \`ios-sim-smoke-${{ github.run_id }}\` artifact on [the run page]($RUN_URL)." || echo "::warning::could not post the review-prompt comment"
+
+      - name: Upload screenshots and Maestro logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ios-sim-smoke-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/smoke-shots/**
+            ${{ runner.temp }}/maestro-debug/**
+            ${{ runner.temp }}/maestro-debug-auth/**

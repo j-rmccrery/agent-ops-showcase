@@ -1,0 +1,5 @@
+{
+  "$comment": "Local clone paths. CI overrides with EVAL_REPOS_ROOT=<dir> containing <owner-less repo name> subdirs.",
+  "your-org/app": "../app",
+  "your-org/backend": "../backend"
+}

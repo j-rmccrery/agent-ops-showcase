@@ -1,0 +1,131 @@
+name: CI
+
+# CI gates.
+# - "checks" runs on every PR: type-check + lint + unit/component tests.
+# - "typecheck" alone does not cover `.web.tsx` platform override
+#   files (plain tsc resolves `./Component` to `Component.tsx`, not the
+#   `.web.tsx` file Metro actually bundles for web). "typecheck-web" closes
+#   that gap via tsconfig.web.json's `moduleSuffixes`.
+# - "test" alone runs jest-expo's native preset — it never aliases
+#   react-native -> react-native-web, so it can't catch bugs (like
+#   Animated.View/className) that only break NativeWind's web class
+#   resolution. "test-web" closes that gap the same way "typecheck-web"
+#   does for types: a separate project (jest.config.web.js) for the web
+#   platform.
+#
+# The live-RC E2E gates (e2e-happy-path, short-screen) live in
+# deploy-web.yml, not here — they need to run after that workflow's RC
+# deploy, not standalone on push. With those gone, nothing here runs on
+# push, so this workflow triggers on pull_request only — a push trigger
+# would produce an all-skipped run on every rc merge.
+#
+# a fresh push to an open PR cancels that PR's still-running CI
+# instead of letting a now-stale run finish and bill. Keyed on the PR
+# number so runs for different PRs never cancel each other; the merge push
+# to rc/main isn't pull_request-triggered, so this never touches an
+# integration run.
+
+on:
+  pull_request:
+    branches:
+      - rc
+      - main
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  typecheck-web:
+    name: Type check (.web.tsx overrides)
+    # plain `tsc --noEmit` never resolves into `.web.tsx` files, so
+    # it can't catch prop-typing bugs scoped to the web platform override
+    #. This job runs the moduleSuffixes-aware config that does.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck:web
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  test:
+    name: Unit + component tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      # ubuntu-latest is a 2-core runner, where jest defaults to
+      # maxWorkers = cores-1 = 1 (near-serial). --maxWorkers=2 uses both cores.
+      # CI-only (not in jest.config.js), so local dev — with more cores and its
+      # own default — is unaffected. No caching involved: this cuts wall-clock,
+      # and therefore billed minutes, on every run including a PR's first.
+      - run: npm test -- --ci --maxWorkers=2
+
+  test-web:
+    name: Unit + component tests (web class resolution)
+    # see the header comment above — separate project so the
+    # react-native-web alias / jsdom environment don't slow down or change
+    # behavior for the native "test" job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run test:web -- --ci
+
+  export-ios:
+    name: iOS bundle check (Metro export)
+    # nothing else in PR CI exercises Metro's iOS bundling — Jest and
+    # tsc never bundle, and the web jobs bundle only the web platform. A
+    # change can bundle cleanly for web and still throw a SyntaxError on the
+    # iOS pipeline (NativeWind's native CSS path), which previously surfaced
+    # only in the post-merge OTA publish, breaking rc for every later ticket.
+    # This runs the same Metro export eas-update performs, pre-merge. Pure
+    # Node — no macOS runner needed. Output is discarded; the exit code is
+    # the gate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npx expo export --platform ios --output-dir "${{ runner.temp }}/export-ios"

@@ -1,0 +1,56 @@
+name: Design QA gate
+
+# design-QA gate: the design-QA-before-merge rule lived only in dispatch's
+# charter, so PRs could merge with no recorded verdict. This job makes the
+# rule trip at the merge itself: it fails unless the PR body carries a design-QA
+# marker line, so once maintainers mark the "Design QA verdict" check required in
+# branch protection, a PR cannot merge green without a recorded verdict.
+#
+# Accepted marker lines (must start at column 0 of the PR body; case-insensitive):
+#   design-qa: passed <https link to the [design-qa] verdict>
+#   design-qa: n/a            (ticket has no Figma field; trailing reason allowed)
+#
+# The column-0 anchor is deliberate: the PR template's guidance comment mentions
+# the marker forms on indented lines, and an indented mention must not satisfy
+# the gate. The body is read from the event payload via an env var — no
+# checkout, no npm install, and no shell interpolation of untrusted body text.
+#
+# `edited` is in the trigger list so fixing the PR body re-runs the check
+# without needing a new push.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+    branches:
+      - rc
+      - main
+
+# cancel a superseded run when the PR is pushed or its body edited
+# again — this gate fires on every `edited`/`synchronize`, so rapid body
+# fixes otherwise stack full runs. Keyed on the PR number. Safe on a
+# required check: cancel only fires when a newer run for the same PR
+# starts, so the latest run always completes and reports the final status;
+# a cancelled superseded run is never the last word.
+concurrency:
+  group: design-qa-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  design-qa-verdict:
+    name: Design QA verdict
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the PR body for a design-qa marker
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if printf '%s\n' "$PR_BODY" | grep -qiE '^design-qa:[[:space:]]*(passed[[:space:]]+https?://[^[:space:]]+|n/a([[:space:]].*)?)[[:space:]]*$'; then
+            echo "Design QA marker found."
+            printf '%s\n' "$PR_BODY" | grep -iE '^design-qa:' | head -1
+          else
+            echo "::error::No design-QA marker in the PR body. Add one line at column 0:"
+            echo "::error::  design-qa: passed <link to the [design-qa] verdict>   (ticket has a Figma field)"
+            echo "::error::  design-qa: n/a                                             (no Figma field on the ticket)"
+            echo "::error::See .github/PULL_REQUEST_TEMPLATE.md. The 'passed' form requires an https link."
+            exit 1
+          fi

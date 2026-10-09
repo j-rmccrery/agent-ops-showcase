@@ -1,0 +1,96 @@
+name: Deploy (dev)
+
+# One deploy environment: dev. This workflow targets the
+# EXISTING dev stack (backend-dev, us-east-1)
+# via the checked-in samconfig.toml at the REPO ROOT — it does not create a
+# new stack or any new AWS infrastructure. There is no staging/prod workflow
+# yet (see README.md "Environments & promotion" for why).
+#
+# Manual-trigger only, by policy: backend deploys are
+# operator-run and attended — routine deploys use scripts/deploy.ps1 from a
+# workstation; this workflow exists as a break-glass alternative and still
+# requires two repo secrets before it can run for real (see README.md):
+#   AWS_ACCESS_KEY_ID
+#   AWS_SECRET_ACCESS_KEY
+# Do NOT add a push trigger or the secrets without a new policy decision —
+# doing so makes every merge to main an unattended deploy of the only stack.
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to dev
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - uses: aws-actions/setup-sam@f84ec7d548307efafe33230528756de3c5841a17 # v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: sam build
+        run: sam build --template-file infrastructure/template.yaml
+
+      # Uses samconfig.toml's [default.deploy.parameters] for stack name,
+      # region, s3 prefix, capabilities, and parameter overrides (Environment,
+      # SecretArn) — all already scoped to the existing dev stack.
+      # --no-confirm-changeset is required because there's no interactive
+      # terminal in CI; samconfig.toml's confirm_changeset=true is meant for
+      # local/manual runs only.
+      - name: sam deploy (existing dev stack)
+        run: sam deploy --no-confirm-changeset --no-fail-on-empty-changeset
+
+      # Unconditional per sam deploy can add/remove routes without API
+      # Gateway actually serving them until a new stage deployment is created.
+      # Running this every time is harmless when nothing changed (creates a
+      # deployment that's a no-op for traffic) and removes the judgment call
+      # of guessing whether this run added a route.
+      - name: Create API Gateway stage deployment (dev)
+        run: aws apigateway create-deployment --rest-api-id ${{ vars.API_ID }} --stage-name dev
+
+      # Verifies the stage deployment above actually took effect on a real
+      # route, the way the manual procedure does: an OPTIONS preflight must
+      # return 200 with Access-Control-Allow-Origin, or the browser app is
+      # broken regardless of what sam/CloudFormation reported. /auth/login is
+      # unauthenticated (security: [] in openapi.yaml) and stable, so no
+      # credentials are needed here.
+      - name: Verify CORS preflight (OPTIONS /auth/login)
+        run: |
+          set -euo pipefail
+          BASE_URL="${API_BASE_URL:-${{ vars.API_BASE_URL }}}"
+          ROUTE="${PREFLIGHT_ROUTE:-/auth/login}"
+          URL="${BASE_URL}${ROUTE}"
+
+          resp="$(curl -s -i -X OPTIONS "$URL" \
+            -H "Origin: ${{ vars.APP_URL }}" \
+            -H "Access-Control-Request-Method: POST")"
+          status="$(printf '%s\n' "$resp" | head -1 | awk '{print $2}')"
+
+          if [ "$status" != "200" ]; then
+            echo "::error::CORS preflight failed: OPTIONS $URL returned HTTP ${status:-<no response>}, expected 200"
+            exit 1
+          fi
+          if ! printf '%s\n' "$resp" | grep -qi '^Access-Control-Allow-Origin:'; then
+            echo "::error::CORS preflight failed: OPTIONS $URL returned 200 but no Access-Control-Allow-Origin header"
+            exit 1
+          fi
+
+          echo "CORS preflight OK: $URL -> 200 with Access-Control-Allow-Origin"

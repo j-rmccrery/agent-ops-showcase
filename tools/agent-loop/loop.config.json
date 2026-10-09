@@ -1,0 +1,108 @@
+{
+  "$comment": "agent-loop configuration — see README.md. Repo paths are relative to the working directory the runner is launched from; use absolute paths if you schedule it from elsewhere.",
+
+  "repos": {
+    "app": {
+      "path": "../app",
+      "worktreeRoot": "../app-worktrees",
+      "baseBranch": "origin/rc",
+      "prBase": "rc",
+      "attribution": "[fe]",
+      "install": "npm ci",
+      "verify": [
+        { "name": "lint", "cmd": "npm run lint" },
+        { "name": "typecheck", "cmd": "npm run typecheck" },
+        { "name": "typecheck:web", "cmd": "npm run typecheck:web" },
+        { "name": "test", "cmd": "npm test -- --ci --silent" },
+        { "name": "test:web", "cmd": "npm run test:web -- --ci --silent" }
+      ]
+    },
+    "backend": {
+      "path": "../backend",
+      "worktreeRoot": "../backend-worktrees",
+      "baseBranch": "origin/main",
+      "prBase": "main",
+      "attribution": "[be]",
+      "install": "npm ci",
+      "verify": [],
+      "enabled": false,
+      "disabledReason": "No baseline here yet (CI, test harness, PR template), and branch protection requires a named human bypass, so agents cannot land work here unattended. Build the baseline before enabling."
+    }
+  },
+
+  "activeRepos": ["app"],
+
+  "keepAwake": true,
+  "$keepAwakeNote": "Holds a Windows SetThreadExecutionState wake lock for the duration of the run, released automatically on exit (including Ctrl-C or a crash) — so the machine only stays up while a run is actually in flight, with no permanent powercfg change to undo. The display is still allowed to sleep. No-op on non-Windows hosts. Set false if you manage sleep yourself (PowerToys Awake, powercfg, a server that never sleeps).",
+
+  "queue": {
+    "source": "linear-then-generated",
+    "$comment": "linear | generated | linear-then-generated. Drains the DoR-ready Linear backlog first; self-generates only if the queue comes up short.",
+    "linearProject": "https://linear.app/your-org/project/your-project",
+    "selfGeneratedMax": 2,
+    "selfGeneratedAllowedKinds": [
+      "test-coverage",
+      "tech-debt",
+      "docs",
+      "refactor-no-behavior-change"
+    ]
+  },
+
+  "budgets": {
+    "$comment": "Mirrors the agent contract / dispatch Modes. Wall-clock and dollars are hard-enforced by the runner; token and tool-call figures are advisory and passed into the worker prompt. Caps derived from observed tickets.",
+    "maxTicketsPerRun": 5,
+    "perTicketMinutes": 90,
+    "perTicketUsd": 12,
+    "perTicketTokensAdvisory": 250000,
+    "perTicketToolCallsAdvisory": 150,
+    "runUsdCeiling": 60,
+    "runWallClockMinutes": 480,
+    "perSupervisorCallUsd": 2
+  },
+
+  "concurrency": {
+    "$comment": "Parallel dispatch is operator policy. The runner supports up to N workers in flight, file-disjoint by planner guarantee, worktree-isolated, git bookends serialized. Merge train stays sequential. Failures count in completion order; stop conditions stop launches and let in-flight tickets finish. First raise watched, not unattended.",
+    "maxParallelWorkers": 2
+  },
+
+  "merge": {
+    "$comment": "Auto-merge into rc only. Enable only once the e2e gate runs against the live RC deploy. TWO switches must be true: 'enabled' is the policy, 'verifiedGateOk' is your attestation that you have seen a clean unattended run and still trust the gate. Set verifiedGateOk to false any time you want PRs queued for review instead - the runner refuses to merge without it, whatever 'enabled' says.",
+    "enabled": true,
+    "verifiedGateOk": true,
+    "target": "rc",
+    "neverTargets": ["main", "prod"],
+    "enforceDeployOrdering": true,
+    "$orderingNote": "One race is open by design: e2e-happy-path is not sequenced after deploy-web.yml's RC deploy, so a fast push can exercise the previous build. The runner closes it - after each merge it waits for the deploy to finish, then triggers e2e against the build that actually shipped, and halts the whole train if that goes red."
+  },
+
+  "model": {
+    "planner": "fable",
+    "worker": "sonnet",
+    "supervisor": "fable"
+  },
+
+  "supervisor": {
+    "$comment": "Checkpoint supervisor: review gate on every green PR before merge-train eligibility, failure triage instead of the blind two-failure counter. Advisory inside hard fences — cannot raise budgets, touch merge config, or unblock escalations. enabled:false restores pre-supervisor behavior exactly.",
+    "enabled": true,
+    "maxRetriesPerTicket": 1
+  },
+
+  "claude": {
+    "permissionMode": "bypassPermissions",
+    "$permissionNote": "acceptEdits auto-approves edits but still prompts on Bash, so an unattended worker cannot run lint/typecheck/test and escalates instead of opening a PR. bypassPermissions is bounded by disallowedTools below — deny rules are enforced in every mode, bypassPermissions included.",
+    "disallowedTools": [
+      "Bash(sam deploy*)",
+      "Bash(eas deploy*)",
+      "Bash(eas submit*)",
+      "Bash(aws cloudformation deploy*)",
+      "Bash(git push --force*)",
+      "Bash(gh pr merge*)",
+      "Bash(gh release create*)"
+    ],
+    "$toolNote": "gh pr merge is denied to WORKERS deliberately. Merging is the runner's job, after its own verification - never a worker's, even when everything looks green."
+  },
+
+  "output": {
+    "runsDir": "runs"
+  }
+}

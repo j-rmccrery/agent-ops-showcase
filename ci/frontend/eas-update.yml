@@ -1,0 +1,108 @@
+name: EAS Update (rc)
+
+# OTA publish pipeline for installed native builds.
+#
+# Push to `rc` -> publish a JS/asset update to the `rc` EAS Update branch.
+# Installed builds on channel `rc` (eas.json's `preview` / `preview-store`
+# profiles) download the update on their next launch and apply it on the
+# launch after that. Web is NOT served by this — deploy-web.yml owns the web
+# surface (EAS Hosting); this workflow owns the native-JS surface.
+#
+# rc only, deliberately: the `production` channel gets no updates until the
+# rc path is proven. Do not add `main` here
+# without its own ticket.
+#
+# Runtime-version constraint (`runtimeVersion.policy = "appVersion"`, with
+# `expo.version` pinned at 1.0.0): an update only reaches binaries whose
+# expo.version matched at build time. JS/TS and Metro-bundled asset changes
+# are OTA-eligible; anything native (new/removed/upgraded native module,
+# Expo SDK bump, app.json/app.config.ts native config, or bumping
+# expo.version itself) needs a new EAS build — see CLAUDE.md "Environments"
+# for the full breakdown.
+#
+# Operative rule for native changes: a native-module or config-plugin change
+# must land TOGETHER with an expo.version bump in the same merge — the bump
+# is the compatibility gate that keeps this auto-publish from reaching old
+# binaries. Otherwise pause this workflow until every channel-rc binary is
+# rebuilt. A native change merged unbumped gets auto-published at
+# runtimeVersion 1.0.0 and crashes existing builds.
+#
+# Env parity: `npm run update:rc` pulls the EAS "preview" environment into
+# .env.local before publishing (the exact mechanism deploy:web:rc uses), so
+# the published bundle embeds the same app.config.ts values as the rc web
+# deploy.
+#
+# Required repo secrets (same pair deploy-web.yml uses):
+# - EXPO_TOKEN      Expo access token for the EAS project.
+#                   Generate at https://expo.dev/settings/access-tokens
+# - EAS_PROJECT_ID  EAS project id consumed by app.config.ts (extra.eas.projectId).
+
+on:
+  push:
+    branches: [rc]
+
+# Serialize publishes: racing rc pushes would otherwise publish out of
+# order (last one to finish wins the "latest update" slot, not the last
+# commit). cancel-in-progress stays false so every push still publishes.
+concurrency:
+  group: eas-update-rc
+  cancel-in-progress: false
+
+jobs:
+  eas-update-rc:
+    name: Publish OTA update to the rc branch
+    runs-on: ubuntu-latest
+    env:
+      EAS_PROJECT_ID: ${{ secrets.EAS_PROJECT_ID }}
+      # Mirrors eas.json's build profiles — no Sentry source-map upload
+      # (SENTRY_DSN is empty today; see app.config.ts).
+      SENTRY_DISABLE_AUTO_UPLOAD: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          # Node 22: eas-cli >= 22.4.0 (installed as `latest` below) requires
+          # Node >= 22 via @oclif/plugin-autocomplete; Node 22 still bundles
+          # npm 10, so `npm ci` lockfile behavior is unchanged.
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Setup EAS CLI
+        uses: expo/expo-github-action@c7b66a9c327a43a8fa7c0158e7f30d6040d2481e # v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Publish update to the rc branch
+        # `git log` (not github.event.head_commit.message interpolated into
+        # the script) so a commit message containing quotes/backticks can't
+        # inject into the shell; %s keeps it to the subject line.
+        run: npm run update:rc -- --message "$(git log -1 --pretty=%s)"
+
+  # run the iOS simulator smoke against the update that was just
+  # published. Chained here (not workflow_run — that trigger only arms once
+  # the listening file reaches the default branch, and doesn't guarantee
+  # publish ordering). The smoke workflow has its own concurrency group
+  # with cancel-in-progress, so stacked rc merges only smoke the final
+  # state even though publishes themselves are serialized above.
+  ios-sim-smoke:
+    name: iOS simulator smoke
+    needs: eas-update-rc
+    # the called workflow's smoke job requests id-token: write (AWS
+    # OIDC for the SES-inbound reader role). A called workflow can never
+    # hold more than its caller grants, and the repo default grants no
+    # id-token — without this explicit grant the whole run dies at parse
+    # time with startup_failure before any job starts.
+    permissions:
+      id-token: write
+      contents: read
+      # For the smoke's human-review prompt comment — same
+      # caller-must-grant rule as id-token above.
+      issues: write
+      pull-requests: write
+    uses: ./.github/workflows/ios-sim-smoke.yml
+    secrets: inherit

@@ -1,0 +1,16 @@
+{
+  "id": "example-build-slugify",
+  "kind": "implement",
+  "repo": "your-org/app",
+  "base": "main",
+  "prompt_file": "ticket.md",
+  "skill": "be-lead",
+  "model": "sonnet",
+  "seed_patch": null,
+  "hidden": ["hidden/"],
+  "judge": [
+    "A slugify(str) function is added under src/utils/ and exported",
+    "Runs of non-alphanumeric characters collapse to a single hyphen with none leading or trailing"
+  ],
+  "deny": ["npm publish", "aws ", "sam "]
+}

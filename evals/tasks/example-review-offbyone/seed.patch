@@ -1,0 +1,13 @@
+diff --git a/src/lib/paginate.js b/src/lib/paginate.js
+new file mode 100644
+index 0000000..3b1c2a4
+--- /dev/null
++++ b/src/lib/paginate.js
+@@ -0,0 +1,7 @@
++// Pages are 1-indexed.
++function paginate(items, page, pageSize) {
++  const start = page * pageSize;
++  return items.slice(start, start + pageSize);
++}
++
++module.exports = { paginate };

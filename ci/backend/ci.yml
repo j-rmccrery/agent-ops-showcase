@@ -1,0 +1,153 @@
+name: CI
+
+# Runs on every PR (and push to main) to catch problems before they reach the
+# dev stack. All three jobs are credential-free by design so they run on
+# every PR without needing AWS secrets configured in the repo.
+#
+# `Test` and `SAM Template Validate` are the two checks meant to be
+# marked Required in main's branch protection ruleset — see the PR body for
+# the exact click-path.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      # package.json currently has no "lint" script (verified 2026-07-10 —
+      # no eslint config in the repo either). `--if-present` makes this a
+      # graceful no-op instead of a hard failure so CI doesn't break on a
+      # script that doesn't exist yet. Add a real "lint" script + eslint
+      # config to package.json to activate this check.
+      - name: Run lint (no-op if no "lint" script is defined)
+        run: npm run lint --if-present
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      # full suite, including tests/smoke/handler-loadability.test.js
+      # (requires every Lambda handler template.yaml points at and asserts
+      # the exported entry point is callable — the exports-clobber bug
+      # class is now a red test, not a live-only failure). Credential-free —
+      # nothing here calls AWS. `--ci` fails the run on any stray
+      # `.only`/snapshot-write attempt instead of silently succeeding, which
+      # matters once this check is Required on main (see PR body).
+      - name: npm test
+        run: npm test -- --ci
+
+  # import smoke for Python handlers. `Test` above walks every handler in
+  # template.yaml, but a Python handler cannot be `require()`d from a Node test
+  # process, so it only gets a static "does `def handler(` exist" check. Both
+  # past import failures were import-time and invisible to that: `No module named
+  # 'joblib'` (a dependency missing from requirements.txt) and
+  # `os.add_dll_directory` (Windows wheels installed into a Linux runtime).
+  # The Python Lambdas failed on EVERY invocation for days behind a green CI run.
+  #
+  # This job closes it the only way that actually proves anything: build the
+  # real deployment package with the real Makefile — the same target
+  # `sam build` runs — on Linux, then import the handler out of the built
+  # artifact and assert it is callable. That is what the Lambda runtime does at
+  # cold start.
+  #
+  # What this does NOT catch, stated plainly: the runner is Linux, so a pip
+  # install here resolves Linux wheels whether or not the Makefile's
+  # `--platform manylinux2014_x86_64` pins are present. Removing the pins would
+  # still pass this job and still break a Lambda built on a Windows machine.
+  # The compensating control is a static assertion that the pins are present in
+  # both Makefiles — tests/smoke/handler-loadability.test.js, "Python Lambda
+  # packaging" — plus `npm run verify:deployed`, which reads the deployed
+  # function's real logs for exactly these import errors after a deploy.
+  python-import:
+    name: Python Lambda Import
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          # Must match the Makefiles' --python-version pin and the template's
+          # Runtime: python3.12. A mismatch here would silently test a
+          # different interpreter than the one Lambda uses.
+          python-version: '3.12'
+
+      # boto3/botocore are provided by the Lambda runtime itself, so they are
+      # deliberately absent from both requirements.txt files (bundling them
+      # wastes ~15MB against the 250MB limit). The runner has no such runtime,
+      # so install them here to stand in for it — otherwise every import below
+      # fails on `import boto3` for a reason that has nothing to do with the
+      # packaging being tested.
+      - name: Install the Lambda runtime's built-in SDK
+        run: pip install boto3
+
+      - name: Build WorkerFunction package (real Makefile target)
+        working-directory: services/worker
+        run: make build-WorkerFunction ARTIFACTS_DIR="${{ runner.temp }}/worker"
+
+      # `app.handler` — infrastructure/template.yaml's Handler for this
+      # function. Imported from the built artifact directory, not from source,
+      # so a dependency that never made it into the package fails here.
+      - name: Import the worker handler from the built package
+        working-directory: ${{ runner.temp }}/worker
+        run: python -c "import app; assert callable(app.handler), 'app.handler is not callable'"
+
+      - name: Build BatchJobFunction package (real Makefile target)
+        working-directory: services
+        run: make build-BatchJobFunction ARTIFACTS_DIR="${{ runner.temp }}/batch"
+
+      # `batch.app.handler` — this one is a dotted package path, and it pulls
+      # in its heavier data dependencies at import time.
+      - name: Import the batch handler from the built package
+        working-directory: ${{ runner.temp }}/batch
+        run: python -c "import batch.app as m; assert callable(m.handler), 'batch.app.handler is not callable'"
+
+  sam-validate:
+    name: SAM Template Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: aws-actions/setup-sam@f84ec7d548307efafe33230528756de3c5841a17 # v2
+        with:
+          # The pip-installed SAM CLI (this action's default) doesn't always
+          # bundle a cfn-lint compatible with --lint on the ubuntu-latest
+          # image; the official installer does. No AWS credentials involved
+          # either way — this just changes how the sam binary itself is
+          # installed on the runner.
+          use-installer: true
+
+      # --lint runs cfn-lint locally against infrastructure/template.yaml.
+      # Deliberately does NOT call the AWS ValidateTemplate API, so this job
+      # needs no AWS credentials and is safe to run on every PR unattended.
+      # See .cfnlintrc.yaml (repo root) for one deliberately-ignored, tracked
+      # check (W2531 — EOL nodejs20.x runtime, out of scope here).
+      - name: sam validate --lint
+        run: sam validate --lint -t infrastructure/template.yaml
+
+      # web-prod.yaml is a standalone plain-CFN stack (no SAM transform),
+      # so it gets its own lint pass with the same bundled cfn-lint + .cfnlintrc.yaml.
+      - name: sam validate --lint (web-prod)
+        run: sam validate --lint --region us-east-1 -t infrastructure/web-prod.yaml

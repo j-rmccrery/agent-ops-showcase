@@ -1,0 +1,13 @@
+{
+  "id": "example-review-offbyone",
+  "kind": "review",
+  "repo": "your-org/backend",
+  "base": "main",
+  "prompt_file": "ticket.md",
+  "skill": "code-review",
+  "model": "sonnet",
+  "seed_patch": "seed.patch",
+  "hidden": [],
+  "judge": [],
+  "deny": ["npm publish", "aws ", "sam "]
+}
